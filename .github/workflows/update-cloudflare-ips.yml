@@ -1,0 +1,264 @@
+name: Update Cloudflare IP Lists
+
+on:
+  schedule:
+    # 每天 01:30 UTC (北京时间 09:30) 自动运行, 与本地 cfdata 任务(20:30)错开
+    - cron: '30 1 * * *'
+  workflow_dispatch:
+    inputs:
+      v6_per_net:
+        description: '每个 IPv6 网段随机提取的地址数'
+        required: false
+        default: '100000'
+
+# GITHUB_TOKEN 推送需要写权限
+permissions:
+  contents: write
+
+# 防止并发运行互相覆盖
+concurrency:
+  group: update-cloudflare-ips
+  cancel-in-progress: false
+
+env:
+  V6_PER_NET: ${{ github.event.inputs.v6_per_net || '100000' }}
+  # 每次提交新增 ~100MB blob, 历史提交数达到阈值后自动压缩为单提交, 防止仓库膨胀
+  SQUASH_THRESHOLD: '10'
+
+jobs:
+  update:
+    name: Generate & Commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Generate IP list files
+        run: |
+          set -euo pipefail
+          python3 - <<'PYEOF'
+          import ipaddress
+          import json
+          import os
+          import random
+          import secrets
+          import sys
+          import time
+          import urllib.request
+          from datetime import datetime
+
+          API_URL = "https://api.cloudflare.com/client/v4/ips?networks=jdcloud"
+          V6_PER_NET = int(os.environ.get("V6_PER_NET", "100000"))
+
+
+          def fetch_api():
+              for attempt in range(3):
+                  try:
+                      req = urllib.request.Request(
+                          API_URL, headers={"User-Agent": "cf-ip-gen/1.0"})
+                      with urllib.request.urlopen(req, timeout=60) as resp:
+                          data = json.loads(resp.read().decode())
+                      if data.get("success") is True:
+                          return data["result"]
+                      print("API 返回异常: %s" % data.get("errors"))
+                  except Exception as exc:
+                      print("API 请求失败(%s)" % exc)
+                  if attempt < 2:
+                      time.sleep(5)
+              sys.exit("错误: Cloudflare API 请求失败(已重试 3 次)")
+
+
+          def gen_hash():
+              """生成 128 位随机哈希数"""
+              return secrets.token_hex(16)
+
+
+          def shuffle_by_hash(lines, seed_hash):
+              """以随机哈希数为种子随机打乱"""
+              rng = random.Random("shuffle:" + seed_hash)
+              rng.shuffle(lines)
+              return lines
+
+
+          def write_file(path, header_lines, ips):
+              with open(path, "w", encoding="utf-8") as f:
+                  for line in header_lines:
+                      f.write(line + "\n")
+                  f.write("\n".join(ips) + "\n")
+
+
+          def now_str():
+              return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+          result = fetch_api()
+          CF_V4 = result.get("ipv4_cidrs") or []
+          CF_V6 = result.get("ipv6_cidrs") or []
+          JD_ALL = result.get("jdcloud_cidrs") or []
+          JD_V4 = [c for c in JD_ALL if ":" not in c]
+          JD_V6 = [c for c in JD_ALL if ":" in c]
+
+          print("京东云 IPv4 段: %d 个" % len(JD_V4))
+          print("京东云 IPv6 段: %d 个" % len(JD_V6))
+          print("全局 IPv4 段: %d 个" % len(CF_V4))
+          print("全局 IPv6 段: %d 个" % len(CF_V6))
+          if not CF_V4 or not CF_V6 or not JD_V4:
+              sys.exit("错误: CIDR 数据提取异常")
+
+          # ---------- 1) 京东云列表: 哈希随机打乱 ----------
+          h_jd = gen_hash()
+          jd_ips = [str(ip) for cidr in JD_V4
+                    for ip in ipaddress.IPv4Network(cidr)]
+          shuffle_by_hash(jd_ips, h_jd)
+          write_file(
+              "cloudflare_JD_ips.txt",
+              [
+                  "# Cloudflare JDCloud IP 列表 - 生成时间: %s" % now_str(),
+                  "# 随机打乱哈希: %s" % h_jd,
+                  "# IPv4 CIDR 段 (已全部展开并按哈希随机打乱):",
+              ]
+              + ["# %s" % c for c in JD_V4]
+              + ["# IPv6 CIDR 段 (不展开):"]
+              + ["# %s" % c for c in JD_V6]
+              + ["# ========================================"],
+              jd_ips,
+          )
+          print("cloudflare_JD_ips.txt: %d 个 IPv4 (打乱哈希 %s)"
+                % (len(jd_ips), h_jd))
+
+          # ---------- 2) 全局 IPv4 列表: 哈希随机打乱 ----------
+          h_v4 = gen_hash()
+          v4_ips = [str(ip) for cidr in CF_V4
+                    for ip in ipaddress.IPv4Network(cidr)]
+          shuffle_by_hash(v4_ips, h_v4)
+          write_file(
+              "cloudflare_ip4s.txt",
+              [
+                  "# Cloudflare 全局 IPv4 列表 - 生成时间: %s" % now_str(),
+                  "# 随机打乱哈希: %s" % h_v4,
+                  "# IPv4 CIDR 段 (已全部展开并按哈希随机打乱):",
+              ]
+              + ["# %s" % c for c in CF_V4]
+              + ["# ========================================"],
+              v4_ips,
+          )
+          print("cloudflare_ip4s.txt: %d 个 IPv4 (打乱哈希 %s)"
+                % (len(v4_ips), h_v4))
+
+          # ---------- 3) 全局 IPv6 列表: 哈希随机提取 + 哈希随机打乱 ----------
+          h_v6_pick = gen_hash()
+          h_v6_shuffle = gen_hash()
+          rng_pick = random.Random("pick:" + h_v6_pick)
+          v6_ips = []
+          for net_str in CF_V6:
+              net = ipaddress.IPv6Network(net_str)
+              host_bits = 128 - net.prefixlen
+              count = min(V6_PER_NET, 1 << host_bits)
+              base_int = int(net.network_address)
+              rr = rng_pick.randrange
+              seen = set()
+              res = []
+              while len(res) < count:
+                  need = count - len(res)
+                  if host_bits <= 64:
+                      vals = [rr(1 << host_bits) for _ in range(need)]
+                  else:
+                      vals = [(rr(1 << (host_bits - 32)) << 32) | rr(1 << 32)
+                              for _ in range(need)]
+                  for v in vals:
+                      if v not in seen:
+                          seen.add(v)
+                          res.append(str(ipaddress.IPv6Address(base_int | v)))
+              v6_ips.extend(res)
+              print("  - %s: 提取 %d 个" % (net_str, len(res)))
+          shuffle_by_hash(v6_ips, h_v6_shuffle)
+          write_file(
+              "cloudflare_ip6s.txt",
+              [
+                  "# Cloudflare IPv6 列表 - 生成时间: %s" % now_str(),
+                  "# 来源网段 (ipv6_cidrs, 每段随机提取 %d 个):" % V6_PER_NET,
+              ]
+              + ["# %s" % c for c in CF_V6]
+              + [
+                  "# 随机提取哈希: %s" % h_v6_pick,
+                  "# 随机打乱哈希: %s" % h_v6_shuffle,
+                  "# =======================================",
+              ],
+              v6_ips,
+          )
+          print("cloudflare_ip6s.txt: %d 个 IPv6 (提取哈希 %s / 打乱哈希 %s)"
+                % (len(v6_ips), h_v6_pick, h_v6_shuffle))
+
+          # ---------- 4) 合并 v4 + v6: 哈希随机打乱 ----------
+          h_merge = gen_hash()
+          merged = v4_ips + v6_ips
+          shuffle_by_hash(merged, h_merge)
+          write_file(
+              "cloudflare_ips.txt",
+              [
+                  "# Cloudflare IP 合并列表 (IPv4 + IPv6) - 生成时间: %s" % now_str(),
+                  "# 来源: cloudflare_ip4s.txt (IPv4) + cloudflare_ip6s.txt (IPv6)",
+                  "# 随机打乱哈希: %s" % h_merge,
+                  "# =======================================",
+              ],
+              merged,
+          )
+          print("cloudflare_ips.txt: %d 个 IP (合并打乱哈希 %s)"
+                % (len(merged), h_merge))
+
+          print("\n全部文件生成完成:")
+          for name in ("cloudflare_JD_ips.txt", "cloudflare_ip4s.txt",
+                       "cloudflare_ip6s.txt", "cloudflare_ips.txt"):
+              print("  - %s (%.1f MB)" % (name, os.path.getsize(name) / 1048576))
+          PYEOF
+
+      - name: Commit and push
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add cloudflare_JD_ips.txt cloudflare_ip4s.txt \
+                  cloudflare_ip6s.txt cloudflare_ips.txt
+
+          if git diff --cached --quiet; then
+            echo "文件无变更, 跳过提交"
+            exit 0
+          fi
+
+          git commit -m "Update Cloudflare IP lists (auto #${{ github.run_number }})"
+
+          # 推送(带重试: 若远端在此期间有新提交则 rebase 后重推)
+          push_ok=0
+          for attempt in 1 2 3; do
+            if git push; then
+              push_ok=1
+              break
+            fi
+            echo "推送失败, 拉取远端变更后重试 ($attempt/3)..."
+            git pull --rebase --autostash origin main || true
+            sleep 5
+          done
+          if [ "$push_ok" -ne 1 ]; then
+            echo "错误: 推送失败"
+            exit 1
+          fi
+          echo "已推送 commit: $(git rev-parse --short HEAD)"
+
+          # ---- 历史体积控制: 提交数达到阈值时压缩为单提交 ----
+          COUNT=$(gh api "repos/$GITHUB_REPOSITORY/commits?per_page=1" --include 2>/dev/null \
+                  | grep -i '^link:' | sed -n 's/.*[?&]page=\([0-9]\+\)>; rel="last".*/\1/p')
+          COUNT=${COUNT:-1}
+          echo "远端提交数: $COUNT (压缩阈值: $SQUASH_THRESHOLD)"
+
+          if [ "$COUNT" -ge "$SQUASH_THRESHOLD" ]; then
+            echo "提交数达到阈值, 将历史压缩为单提交(仅保留当前文件内容)..."
+            git checkout --orphan squash-tmp
+            git add -A
+            git commit -m "Squash history: auto-generated Cloudflare IP lists"
+            git push --force origin squash-tmp:main
+            echo "历史已压缩, 仓库恢复单提交状态"
+          fi
